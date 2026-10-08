@@ -20,10 +20,11 @@ class SaPE2D(nn.Module):
 
         sape_x = self._interpx__(p_x,W_patched,q)
 
+        b_x = torch.cdist(sape_x,sape_x,p=2.0)
+        # ||sape_x[i] - sape_x[n]||_2
 
 
-
-        return sape_x
+        return b_x
 
     def _calc_g_x(self,q,k,H_patched,W_patched):
         g_x = []
