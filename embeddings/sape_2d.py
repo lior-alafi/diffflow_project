@@ -15,16 +15,32 @@ class SaPE2D(nn.Module):
 
     def forward(self,q,k,H_patched,W_patched,**kwargs):
         # q, k[B, heads, T, d]
-        g_x = self._calc_g_x(q,k,H_patched,W_patched)
-        p_x = self._calc_p_x(g_x)
 
-        sape_x = self._interpx__(p_x,W_patched,q)
+        B, heads, T, d = q.shape
+
+        assert k.shape == q.shape
+        assert d == self.head_dim
+        assert T == H_patched * W_patched
+
+        g_x = self._calc_g_x(q,k,H_patched,W_patched)
+        p_x = self._calc_p(g_x)
+
+        sape_x = self._interp_x(p_x,W_patched,q)
 
         b_x = torch.cdist(sape_x,sape_x,p=2.0)
         # ||sape_x[i] - sape_x[n]||_2
+        # equivalent to
+        # a = x.unsqueeze(-2)
+        # b = x.unsqueeze(-3)
+        # diff = a - b
+        # torch.norm(diff)
 
+        g_y = self._calc_g_y(q,k,H_patched,W_patched)
+        p_y = self._calc_p(g_y)
+        sape_y = self._interp_y(p_y, W_patched, q)
+        b_y = torch.cdist(sape_y,sape_y,p=2.0)
 
-        return b_x
+        return b_x + b_y
 
     def _calc_g_x(self,q,k,H_patched,W_patched):
         g_x = []
@@ -42,15 +58,15 @@ class SaPE2D(nn.Module):
             g_x.append(g_x_i)
         return g_x
 
-    def _calc_p_x(self,g):
-        p_x = []
-        for g_x_i in g:
-            p_x_i = g_x_i.flip(-1).cumsum(-1).flip(-1)
-            p_x_i = p_x_i.clamp(max=self.max_npos - 1)
-            # [B, heads, W, W]
-            p_x.append(p_x_i)
+    def _calc_p(self, g):
+        p = []
+        for g_i in g:
+            p_i = g_i.flip(-1).cumsum(-1).flip(-1)
+            p_i = p_i.clamp(max=self.max_npos - 1)
+            # if g_x: [B, heads, W, W] if g_y: [B, heads, H, H]
+            p.append(p_i)
 
-        return p_x
+        return p
 
 
     def _interp_x(self,p_x,W_patched,q):
@@ -80,3 +96,41 @@ class SaPE2D(nn.Module):
         interp_x = interp_x.flatten(2, 3)
         # [B, heads, T , W]
         return interp_x
+
+    def _calc_g_y(self,q,k,H_patched,W_patched):
+        g_y = []
+
+        for i in range(W_patched):
+            q_col = q[...,i::W_patched,:]
+            # q_col: [B, heads, H, d]
+            k_col = k[..., i::W_patched, :]
+
+            # [B, heads, H, H]
+            g_y_i = torch.sigmoid(q_col @ k_col.transpose(-2,-1))
+            g_y.append(g_y_i)
+
+        return g_y
+
+    def _interp_y(self,p_y,W_patched,q):
+        interp_y = []
+        z = q @ self.e_y
+        # [B, heads, T, P]
+
+        for i,p_y_i in enumerate(p_y):
+            z_col = z[...,i::W_patched,:]
+            u = p_y_i.ceil().long()
+            l = p_y_i.floor().long()
+            w = p_y_i - l
+
+            z_ceil = z_col.gather(-1,u)
+            z_floor = z_col.gather(-1,l)
+            interp = w * z_ceil + (1-w)*z_floor
+            interp_y.append(interp)
+
+        interp_y = torch.stack(interp_y,dim=2)
+        #now we need to fix # [B, heads, W, H, H] -> # [B,heads,H,W,H]
+        interp_y = interp_y.transpose(2,3)
+        interp_y = interp_y.flatten(2,3)
+
+
+        return interp_y

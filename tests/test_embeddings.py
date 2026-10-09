@@ -34,7 +34,7 @@ from embeddings import (
     RoPE2D,
     CoPE1D,
 )
-
+from embeddings.sape_2d import SaPE2D
 
 ATOL = 1e-5
 RTOL = 1e-5
@@ -841,3 +841,883 @@ def test_rope_2d_rejects_head_dim_not_divisible_by_4():
 
     with pytest.raises((AssertionError, ValueError, RuntimeError)):
         rope(q, k, hp, wp)
+
+# ============================================================
+# SaPE2D
+# ============================================================
+
+@pytest.mark.parametrize(
+    "H, W",
+    [
+        (2, 3),
+        (3, 3),
+        (3, 2),
+    ]
+)
+def test_sape_2d_shape(H, W):
+    B = 2
+    HEADS = 4
+    D = 8
+    T = H * W
+
+    sape = SaPE2D(
+        head_dim=D,
+        max_npos=8,
+    )
+
+    q = torch.randn(B, HEADS, T, D)
+    k = torch.randn(B, HEADS, T, D)
+
+    out = sape(q, k, H, W)
+
+    assert out.shape == (B, HEADS, T, T)
+
+
+@pytest.mark.parametrize(
+    "H, W",
+    [
+        (2, 3),
+        (3, 3),
+        (3, 2),
+    ]
+)
+def test_sape_2d_gx_gy_shapes(H, W):
+    B = 2
+    HEADS = 3
+    D = 4
+    T = H * W
+
+    sape = SaPE2D(
+        head_dim=D,
+        max_npos=8,
+    )
+
+    q = torch.randn(B, HEADS, T, D)
+    k = torch.randn_like(q)
+
+    g_x = sape._calc_g_x(q, k, H, W)
+    g_y = sape._calc_g_y(q, k, H, W)
+
+    # one matrix for every row
+    assert len(g_x) == H
+
+    for g_x_i in g_x:
+        assert g_x_i.shape == (
+            B,
+            HEADS,
+            W,
+            W,
+        )
+
+    # one matrix for every column
+    assert len(g_y) == W
+
+    for g_y_i in g_y:
+        assert g_y_i.shape == (
+            B,
+            HEADS,
+            H,
+            H,
+        )
+
+
+@pytest.mark.parametrize(
+    "H, W",
+    [
+        (2, 3),
+        (3, 3),
+        (3, 2),
+    ]
+)
+def test_sape_2d_gx_uses_correct_rows(H, W):
+    """
+    Verify that _calc_g_x actually groups tokens by image rows.
+
+    q/k contain:
+        token 0 -> 0
+        token 1 -> 1
+        ...
+    """
+
+    T = H * W
+
+    sape = SaPE2D(
+        head_dim=1,
+        max_npos=8,
+    )
+
+    q = torch.arange(
+        T,
+        dtype=torch.float32
+    ).reshape(1, 1, T, 1)
+
+    k = q.clone()
+
+    g_x = sape._calc_g_x(
+        q,
+        k,
+        H,
+        W,
+    )
+
+    for row in range(H):
+        start = row * W
+        end = (row + 1) * W
+
+        values = q[0, 0, start:end, 0]
+
+        expected = torch.sigmoid(
+            values.unsqueeze(1)
+            * values.unsqueeze(0)
+        )
+
+        assert torch.allclose(
+            g_x[row][0, 0],
+            expected,
+            atol=1e-6,
+        )
+
+
+@pytest.mark.parametrize(
+    "H, W",
+    [
+        (2, 3),
+        (3, 3),
+        (3, 2),
+    ]
+)
+def test_sape_2d_gy_uses_correct_columns(H, W):
+    """
+    Verify that _calc_g_y groups tokens by columns.
+
+    For H=2,W=3:
+
+        tokens:
+        0 1 2
+        3 4 5
+
+        columns:
+        [0,3]
+        [1,4]
+        [2,5]
+    """
+
+    T = H * W
+
+    sape = SaPE2D(
+        head_dim=1,
+        max_npos=8,
+    )
+
+    q = torch.arange(
+        T,
+        dtype=torch.float32
+    ).reshape(1, 1, T, 1)
+
+    k = q.clone()
+
+    g_y = sape._calc_g_y(
+        q,
+        k,
+        H,
+        W,
+    )
+
+    for col in range(W):
+        values = q[0, 0, col::W, 0]
+
+        expected = torch.sigmoid(
+            values.unsqueeze(1)
+            * values.unsqueeze(0)
+        )
+
+        assert torch.allclose(
+            g_y[col][0, 0],
+            expected,
+            atol=1e-6,
+        )
+
+
+@pytest.mark.parametrize(
+    "size",
+    [
+        2,
+        3,
+    ]
+)
+def test_sape_2d_calc_p_reverse_cumsum(size):
+    """
+    If every g value is 0.5:
+
+    size=2:
+        [0.5, 0.5]
+          ->
+        [1.0, 0.5]
+
+    size=3:
+        [0.5, 0.5, 0.5]
+          ->
+        [1.5, 1.0, 0.5]
+    """
+
+    sape = SaPE2D(
+        head_dim=1,
+        max_npos=8,
+    )
+
+    g = [
+        torch.full(
+            (1, 1, size, size),
+            0.5
+        )
+    ]
+
+    p = sape._calc_p(g)[0]
+
+    expected_row = (
+        torch.arange(
+            size,
+            0,
+            -1,
+            dtype=torch.float32
+        )
+        * 0.5
+    )
+
+    expected = (
+        expected_row
+        .reshape(1, 1, 1, size)
+        .expand(1, 1, size, size)
+    )
+
+    assert torch.allclose(
+        p,
+        expected,
+        atol=1e-6,
+    )
+
+
+def test_sape_2d_calc_p_clamp():
+    """
+    g = 1 with length 5 gives:
+
+        reverse cumsum:
+        [5,4,3,2,1]
+
+    max_npos=3 means maximum index is 2:
+
+        [2,2,2,2,1]
+    """
+
+    sape = SaPE2D(
+        head_dim=1,
+        max_npos=3,
+    )
+
+    g = [
+        torch.ones(
+            1, 1, 5, 5
+        )
+    ]
+
+    p = sape._calc_p(g)[0]
+
+    expected_row = torch.tensor(
+        [2., 2., 2., 2., 1.]
+    )
+
+    expected = (
+        expected_row
+        .reshape(1, 1, 1, 5)
+        .expand(1, 1, 5, 5)
+    )
+
+    assert torch.allclose(
+        p,
+        expected,
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize(
+    "H, W",
+    [
+        (2, 3),
+        (3, 3),
+        (3, 2),
+    ]
+)
+def test_sape_2d_interp_x(H, W):
+    """
+    e_x:
+        position 0 -> 0
+        position 1 -> 10
+        position 2 -> 20
+        ...
+
+    q = 1
+
+    Therefore interpolation at p should produce:
+        10 * p
+    """
+
+    T = H * W
+    MAX_NPOS = 8
+
+    sape = SaPE2D(
+        head_dim=1,
+        max_npos=MAX_NPOS,
+    )
+
+    with torch.no_grad():
+        sape.e_x.copy_(
+            (
+                torch.arange(
+                    MAX_NPOS,
+                    dtype=torch.float32
+                ) * 10
+            ).reshape(1, 1, MAX_NPOS)
+        )
+
+    q = torch.ones(
+        1,
+        1,
+        T,
+        1,
+    )
+
+    # same positions we would get from
+    # reverse-cumsum(sigmoid(0))
+    p_row = (
+        torch.arange(
+            W,
+            0,
+            -1,
+            dtype=torch.float32
+        )
+        * 0.5
+    )
+
+    p_matrix = (
+        p_row
+        .reshape(1, 1, 1, W)
+        .expand(1, 1, W, W)
+        .clone()
+    )
+
+    p_x = [
+        p_matrix.clone()
+        for _ in range(H)
+    ]
+
+    out = sape._interp_x(
+        p_x,
+        W,
+        q,
+    )
+
+    assert out.shape == (
+        1,
+        1,
+        T,
+        W,
+    )
+
+    expected_row = p_row * 10
+
+    expected = (
+        expected_row
+        .reshape(1, 1, 1, W)
+        .expand(1, 1, T, W)
+    )
+
+    assert torch.allclose(
+        out,
+        expected,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize(
+    "H, W",
+    [
+        (2, 3),
+        (3, 3),
+        (3, 2),
+    ]
+)
+def test_sape_2d_interp_y(H, W):
+    """
+    Same interpolation test as X,
+    but for the vertical axis.
+    """
+
+    T = H * W
+    MAX_NPOS = 8
+
+    sape = SaPE2D(
+        head_dim=1,
+        max_npos=MAX_NPOS,
+    )
+
+    with torch.no_grad():
+        sape.e_y.copy_(
+            (
+                torch.arange(
+                    MAX_NPOS,
+                    dtype=torch.float32
+                ) * 10
+            ).reshape(1, 1, MAX_NPOS)
+        )
+
+    q = torch.ones(
+        1,
+        1,
+        T,
+        1,
+    )
+
+    p_col = (
+        torch.arange(
+            H,
+            0,
+            -1,
+            dtype=torch.float32
+        )
+        * 0.5
+    )
+
+    p_matrix = (
+        p_col
+        .reshape(1, 1, 1, H)
+        .expand(1, 1, H, H)
+        .clone()
+    )
+
+    # one p_y matrix per image column
+    p_y = [
+        p_matrix.clone()
+        for _ in range(W)
+    ]
+
+    out = sape._interp_y(
+        p_y,
+        W,
+        q,
+    )
+
+    assert out.shape == (
+        1,
+        1,
+        T,
+        H,
+    )
+
+    expected_col = p_col * 10
+
+    expected = (
+        expected_col
+        .reshape(1, 1, 1, H)
+        .expand(1, 1, T, H)
+    )
+
+    assert torch.allclose(
+        out,
+        expected,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize(
+    "H, W",
+    [
+        (2, 3),
+        (3, 3),
+        (3, 2),
+    ]
+)
+def test_sape_2d_interp_preserves_token_order(H, W):
+    """
+    Important test for the stack -> transpose -> flatten logic.
+
+    If p == 0 and:
+        e_x[0] = e_y[0] = 1
+
+    then each token's interpolated value should simply
+    contain q[token].
+
+    This verifies that after processing rows/columns,
+    tokens return to row-major order.
+    """
+
+    T = H * W
+
+    sape = SaPE2D(
+        head_dim=1,
+        max_npos=2,
+    )
+
+    with torch.no_grad():
+        sape.e_x.zero_()
+        sape.e_y.zero_()
+
+        sape.e_x[..., 0] = 1.0
+        sape.e_y[..., 0] = 1.0
+
+    q = torch.arange(
+        1,
+        T + 1,
+        dtype=torch.float32,
+    ).reshape(1, 1, T, 1)
+
+    # --------------------------
+    # X
+    # --------------------------
+
+    p_x = [
+        torch.zeros(
+            1,
+            1,
+            W,
+            W
+        )
+        for _ in range(H)
+    ]
+
+    interp_x = sape._interp_x(
+        p_x,
+        W,
+        q,
+    )
+
+    expected_x = (
+        q.squeeze(-1)
+        .unsqueeze(-1)
+        .expand(1, 1, T, W)
+    )
+
+    assert torch.allclose(
+        interp_x,
+        expected_x,
+        atol=1e-6,
+    )
+
+    # --------------------------
+    # Y
+    # --------------------------
+
+    p_y = [
+        torch.zeros(
+            1,
+            1,
+            H,
+            H
+        )
+        for _ in range(W)
+    ]
+
+    interp_y = sape._interp_y(
+        p_y,
+        W,
+        q,
+    )
+
+    expected_y = (
+        q.squeeze(-1)
+        .unsqueeze(-1)
+        .expand(1, 1, T, H)
+    )
+
+    assert torch.allclose(
+        interp_y,
+        expected_y,
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize(
+    "H, W",
+    [
+        (2, 3),
+        (3, 3),
+        (3, 2),
+    ]
+)
+def test_sape_2d_output_is_symmetric(H, W):
+    """
+    b_x and b_y are pairwise Euclidean distance matrices.
+
+    Therefore:
+        b[i,j] == b[j,i]
+    """
+
+    B = 2
+    HEADS = 3
+    D = 4
+    T = H * W
+
+    sape = SaPE2D(
+        head_dim=D,
+        max_npos=8,
+    )
+
+    q = torch.randn(B, HEADS, T, D)
+    k = torch.randn_like(q)
+
+    out = sape(q, k, H, W)
+
+    assert torch.allclose(
+        out,
+        out.transpose(-1, -2),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+
+@pytest.mark.parametrize(
+    "H, W",
+    [
+        (2, 3),
+        (3, 3),
+        (3, 2),
+    ]
+)
+def test_sape_2d_diagonal_is_zero(H, W):
+    """
+    Distance of every token from itself must be zero.
+    """
+
+    B = 2
+    HEADS = 3
+    D = 4
+    T = H * W
+
+    sape = SaPE2D(
+        head_dim=D,
+        max_npos=8,
+    )
+
+    q = torch.randn(B, HEADS, T, D)
+    k = torch.randn_like(q)
+
+    out = sape(q, k, H, W)
+
+    diagonal = torch.diagonal(
+        out,
+        dim1=-2,
+        dim2=-1,
+    )
+
+    assert torch.allclose(
+        diagonal,
+        torch.zeros_like(diagonal),
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize(
+    "H, W",
+    [
+        (2, 3),
+        (3, 3),
+        (3, 2),
+    ]
+)
+def test_sape_2d_output_is_non_negative(H, W):
+    B = 2
+    HEADS = 3
+    D = 4
+    T = H * W
+
+    sape = SaPE2D(
+        head_dim=D,
+        max_npos=8,
+    )
+
+    q = torch.randn(B, HEADS, T, D)
+    k = torch.randn_like(q)
+
+    out = sape(q, k, H, W)
+
+    assert torch.all(out >= 0)
+
+
+@pytest.mark.parametrize(
+    "H, W",
+    [
+        (2, 3),
+        (3, 3),
+        (3, 2),
+    ]
+)
+def test_sape_2d_zero_q_gives_zero_output(H, W):
+    """
+    z = q @ e
+
+    so if q == 0:
+        z == 0
+        interpolated embeddings == 0
+        pairwise distances == 0
+    """
+
+    B = 2
+    HEADS = 3
+    D = 4
+    T = H * W
+
+    sape = SaPE2D(
+        head_dim=D,
+        max_npos=8,
+    )
+
+    q = torch.zeros(
+        B,
+        HEADS,
+        T,
+        D,
+    )
+
+    k = torch.randn_like(q)
+
+    out = sape(q, k, H, W)
+
+    assert torch.allclose(
+        out,
+        torch.zeros_like(out),
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize(
+    "H, W",
+    [
+        (2, 3),
+        (3, 3),
+        (3, 2),
+    ]
+)
+def test_sape_2d_zero_embeddings_give_zero_output(H, W):
+    """
+    Even with non-zero q/k, if e_x and e_y are zero,
+    SaPE embeddings must be zero and therefore all distances
+    must be zero.
+    """
+
+    B = 2
+    HEADS = 3
+    D = 4
+    T = H * W
+
+    sape = SaPE2D(
+        head_dim=D,
+        max_npos=8,
+    )
+
+    with torch.no_grad():
+        sape.e_x.zero_()
+        sape.e_y.zero_()
+
+    q = torch.randn(B, HEADS, T, D)
+    k = torch.randn_like(q)
+
+    out = sape(q, k, H, W)
+
+    assert torch.allclose(
+        out,
+        torch.zeros_like(out),
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize(
+    "H, W",
+    [
+        (2, 3),
+        (3, 3),
+        (3, 2),
+    ]
+)
+def test_sape_2d_backward(H, W):
+    B = 2
+    HEADS = 2
+    D = 4
+    T = H * W
+
+    sape = SaPE2D(
+        head_dim=D,
+        max_npos=8,
+    )
+
+    q = torch.randn(
+        B,
+        HEADS,
+        T,
+        D,
+        requires_grad=True,
+    )
+
+    k = torch.randn(
+        B,
+        HEADS,
+        T,
+        D,
+        requires_grad=True,
+    )
+
+    out = sape(q, k, H, W)
+
+    loss = out.mean()
+    loss.backward()
+
+    assert q.grad is not None
+    assert k.grad is not None
+
+    assert sape.e_x.grad is not None
+    assert sape.e_y.grad is not None
+
+    assert torch.isfinite(q.grad).all()
+    assert torch.isfinite(k.grad).all()
+    assert torch.isfinite(sape.e_x.grad).all()
+    assert torch.isfinite(sape.e_y.grad).all()
+
+
+def test_sape_2d_rejects_wrong_token_count():
+    sape = SaPE2D(
+        head_dim=4,
+        max_npos=8,
+    )
+
+    # H=2,W=3 means T must be 6,
+    # but here T=5.
+    q = torch.randn(1, 2, 5, 4)
+    k = torch.randn_like(q)
+
+    with pytest.raises(AssertionError):
+        sape(q, k, 2, 3)
+
+
+def test_sape_2d_rejects_wrong_head_dim():
+    sape = SaPE2D(
+        head_dim=4,
+        max_npos=8,
+    )
+
+    # actual d=6 != configured head_dim=4
+    q = torch.randn(1, 2, 6, 6)
+    k = torch.randn_like(q)
+
+    with pytest.raises(AssertionError):
+        sape(q, k, 2, 3)
+
+
+def test_sape_2d_rejects_different_q_k_shapes():
+    sape = SaPE2D(
+        head_dim=4,
+        max_npos=8,
+    )
+
+    q = torch.randn(1, 2, 6, 4)
+    k = torch.randn(1, 3, 6, 4)
+
+    with pytest.raises(AssertionError):
+        sape(q, k, 2, 3)
