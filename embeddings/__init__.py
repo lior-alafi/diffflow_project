@@ -4,3 +4,4 @@ from .cope_1d import CoPE1D
 from .patch_embed import PatchEmbedd
 from .rope_1d import RoPE1D
 from .rope_2d import RoPE2D
+from .sape_2d import SaPE2D
