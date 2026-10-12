@@ -898,27 +898,24 @@ def test_sape_2d_gx_gy_shapes(H, W):
     g_x = sape._calc_g_x(q, k, H, W)
     g_y = sape._calc_g_y(q, k, H, W)
 
-    # one matrix for every row
-    assert len(g_x) == H
+    # Vectorized representation:
+    # one W x W gate matrix per image row.
+    assert g_x.shape == (
+        B,
+        HEADS,
+        H,
+        W,
+        W,
+    )
 
-    for g_x_i in g_x:
-        assert g_x_i.shape == (
-            B,
-            HEADS,
-            W,
-            W,
-        )
-
-    # one matrix for every column
-    assert len(g_y) == W
-
-    for g_y_i in g_y:
-        assert g_y_i.shape == (
-            B,
-            HEADS,
-            H,
-            H,
-        )
+    # one H x H gate matrix per image column.
+    assert g_y.shape == (
+        B,
+        HEADS,
+        W,
+        H,
+        H,
+    )
 
 
 @pytest.mark.parametrize(
@@ -937,6 +934,9 @@ def test_sape_2d_gx_uses_correct_rows(H, W):
         token 0 -> 0
         token 1 -> 1
         ...
+
+    Vectorized g_x has shape:
+        [B, heads, H, W, W]
     """
 
     T = H * W
@@ -972,7 +972,7 @@ def test_sape_2d_gx_uses_correct_rows(H, W):
         )
 
         assert torch.allclose(
-            g_x[row][0, 0],
+            g_x[0, 0, row],
             expected,
             atol=1e-6,
         )
@@ -1000,6 +1000,9 @@ def test_sape_2d_gy_uses_correct_columns(H, W):
         [0,3]
         [1,4]
         [2,5]
+
+    Vectorized g_y has shape:
+        [B, heads, W, H, H]
     """
 
     T = H * W
@@ -1032,7 +1035,7 @@ def test_sape_2d_gy_uses_correct_columns(H, W):
         )
 
         assert torch.allclose(
-            g_y[col][0, 0],
+            g_y[0, 0, col],
             expected,
             atol=1e-6,
         )
@@ -1058,6 +1061,9 @@ def test_sape_2d_calc_p_reverse_cumsum(size):
         [0.5, 0.5, 0.5]
           ->
         [1.5, 1.0, 0.5]
+
+    _calc_p is now fully vectorized and returns a tensor
+    with the same shape as g.
     """
 
     sape = SaPE2D(
@@ -1065,14 +1071,14 @@ def test_sape_2d_calc_p_reverse_cumsum(size):
         max_npos=8,
     )
 
-    g = [
-        torch.full(
-            (1, 1, size, size),
-            0.5
-        )
-    ]
+    # Representative vectorized X-style tensor:
+    # [B, heads, H=1, size, size]
+    g = torch.full(
+        (1, 1, 1, size, size),
+        0.5,
+    )
 
-    p = sape._calc_p(g)[0]
+    p = sape._calc_p(g)
 
     expected_row = (
         torch.arange(
@@ -1086,9 +1092,11 @@ def test_sape_2d_calc_p_reverse_cumsum(size):
 
     expected = (
         expected_row
-        .reshape(1, 1, 1, size)
-        .expand(1, 1, size, size)
+        .reshape(1, 1, 1, 1, size)
+        .expand(1, 1, 1, size, size)
     )
+
+    assert p.shape == g.shape
 
     assert torch.allclose(
         p,
@@ -1114,13 +1122,11 @@ def test_sape_2d_calc_p_clamp():
         max_npos=3,
     )
 
-    g = [
-        torch.ones(
-            1, 1, 5, 5
-        )
-    ]
+    g = torch.ones(
+        1, 1, 1, 5, 5
+    )
 
-    p = sape._calc_p(g)[0]
+    p = sape._calc_p(g)
 
     expected_row = torch.tensor(
         [2., 2., 2., 2., 1.]
@@ -1128,8 +1134,8 @@ def test_sape_2d_calc_p_clamp():
 
     expected = (
         expected_row
-        .reshape(1, 1, 1, 5)
-        .expand(1, 1, 5, 5)
+        .reshape(1, 1, 1, 1, 5)
+        .expand(1, 1, 1, 5, 5)
     )
 
     assert torch.allclose(
@@ -1159,6 +1165,9 @@ def test_sape_2d_interp_x(H, W):
 
     Therefore interpolation at p should produce:
         10 * p
+
+    p_x is now a single tensor:
+        [B, heads, H, W, W]
     """
 
     T = H * W
@@ -1186,8 +1195,8 @@ def test_sape_2d_interp_x(H, W):
         1,
     )
 
-    # same positions we would get from
-    # reverse-cumsum(sigmoid(0))
+    # Same positions we would get from
+    # reverse-cumsum(sigmoid(0)).
     p_row = (
         torch.arange(
             W,
@@ -1198,21 +1207,15 @@ def test_sape_2d_interp_x(H, W):
         * 0.5
     )
 
-    p_matrix = (
+    p_x = (
         p_row
-        .reshape(1, 1, 1, W)
-        .expand(1, 1, W, W)
+        .reshape(1, 1, 1, 1, W)
+        .expand(1, 1, H, W, W)
         .clone()
     )
 
-    p_x = [
-        p_matrix.clone()
-        for _ in range(H)
-    ]
-
     out = sape._interp_x(
         p_x,
-        W,
         q,
     )
 
@@ -1250,6 +1253,9 @@ def test_sape_2d_interp_y(H, W):
     """
     Same interpolation test as X,
     but for the vertical axis.
+
+    p_y is now a single tensor:
+        [B, heads, W, H, H]
     """
 
     T = H * W
@@ -1287,22 +1293,15 @@ def test_sape_2d_interp_y(H, W):
         * 0.5
     )
 
-    p_matrix = (
+    p_y = (
         p_col
-        .reshape(1, 1, 1, H)
-        .expand(1, 1, H, H)
+        .reshape(1, 1, 1, 1, H)
+        .expand(1, 1, W, H, H)
         .clone()
     )
 
-    # one p_y matrix per image column
-    p_y = [
-        p_matrix.clone()
-        for _ in range(W)
-    ]
-
     out = sape._interp_y(
         p_y,
-        W,
         q,
     )
 
@@ -1338,7 +1337,7 @@ def test_sape_2d_interp_y(H, W):
 )
 def test_sape_2d_interp_preserves_token_order(H, W):
     """
-    Important test for the stack -> transpose -> flatten logic.
+    Important test for the reshape/transpose/flatten logic.
 
     If p == 0 and:
         e_x[0] = e_y[0] = 1
@@ -1346,8 +1345,8 @@ def test_sape_2d_interp_preserves_token_order(H, W):
     then each token's interpolated value should simply
     contain q[token].
 
-    This verifies that after processing rows/columns,
-    tokens return to row-major order.
+    This verifies that the vectorized implementation preserves
+    row-major token order after the Y-axis transpose.
     """
 
     T = H * W
@@ -1374,19 +1373,16 @@ def test_sape_2d_interp_preserves_token_order(H, W):
     # X
     # --------------------------
 
-    p_x = [
-        torch.zeros(
-            1,
-            1,
-            W,
-            W
-        )
-        for _ in range(H)
-    ]
+    p_x = torch.zeros(
+        1,
+        1,
+        H,
+        W,
+        W,
+    )
 
     interp_x = sape._interp_x(
         p_x,
-        W,
         q,
     )
 
@@ -1406,19 +1402,16 @@ def test_sape_2d_interp_preserves_token_order(H, W):
     # Y
     # --------------------------
 
-    p_y = [
-        torch.zeros(
-            1,
-            1,
-            H,
-            H
-        )
-        for _ in range(W)
-    ]
+    p_y = torch.zeros(
+        1,
+        1,
+        W,
+        H,
+        H,
+    )
 
     interp_y = sape._interp_y(
         p_y,
-        W,
         q,
     )
 

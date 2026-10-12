@@ -25,7 +25,7 @@ class SaPE2D(nn.Module):
         g_x = self._calc_g_x(q,k,H_patched,W_patched)
         p_x = self._calc_p(g_x)
 
-        sape_x = self._interp_x(p_x,W_patched,q)
+        sape_x = self._interp_x(p_x,q)
 
         b_x = torch.cdist(sape_x,sape_x,p=2.0)
         # ||sape_x[i] - sape_x[n]||_2
@@ -37,97 +37,82 @@ class SaPE2D(nn.Module):
 
         g_y = self._calc_g_y(q,k,H_patched,W_patched)
         p_y = self._calc_p(g_y)
-        sape_y = self._interp_y(p_y, W_patched, q)
+        sape_y = self._interp_y(p_y, q)
         b_y = torch.cdist(sape_y,sape_y,p=2.0)
 
         return b_x + b_y
 
     def _calc_g_x(self,q,k,H_patched,W_patched):
-        g_x = []
+        B_q, heads_q, T_q, d_q = q.shape
+        B_k, heads_k, T_k, d_k = k.shape
+        q_row = q.reshape(B_q, heads_q, H_patched,W_patched, d_q)
+        k_row = k.reshape(B_k, heads_k, H_patched,W_patched, d_k)
+        g_x = torch.sigmoid(q_row @ k_row.transpose(-2, -1))
+        # [B, heads,H, W, W]
 
-        for i in range(H_patched):
-            start = i*W_patched
-            end = (i+1)*W_patched
-            q_row = q[...,start:end,:]
-            #q_row: [B, heads, W, d]
-            k_row = k[...,start:end,:]
-            # k_row: [B, heads, W, d]
-            g_x_i = torch.sigmoid(q_row @ k_row.transpose(-2,-1))
-
-            #[B, heads, W, W]
-            g_x.append(g_x_i)
         return g_x
 
     def _calc_p(self, g):
-        p = []
-        for g_i in g:
-            p_i = g_i.flip(-1).cumsum(-1).flip(-1)
-            p_i = p_i.clamp(max=self.max_npos - 1)
-            # if g_x: [B, heads, W, W] if g_y: [B, heads, H, H]
-            p.append(p_i)
+
+        p = g.flip(-1).cumsum(-1).flip(-1)
+        p = p.clamp(max=self.max_npos - 1)
+        # if g_x: [B, heads,H, W, W] if g_y: [B, heads,W, H, H]
 
         return p
 
 
-    def _interp_x(self,p_x,W_patched,q):
+    def _interp_x(self,p_x,q):
         #creating SaPE_x^2[i] \in R^W
 
         z = q @ self.e_x
         # [B, heads, T, P]
-        interp_x = []
-        for i,p_x_i in enumerate(p_x):
-            start = i*W_patched
-            end = (i+1)*W_patched
-            z_row = z[...,start:end,:]
-            # [B,heads, W, P]
+        B, heads, T, P = z.shape
 
-            u = p_x_i.ceil().long()
-            l = p_x_i.floor().long()
-            w = p_x_i - l
-            z_ceil = z_row.gather(-1,u)
-            # gather causes [B, heads, W, W]
-            z_floor = z_row.gather(-1,l)
-            interp = w*z_ceil+(1-w)*z_floor
-            # [B, heads, W, W]
-            interp_x.append(interp)
-
-        interp_x = torch.stack(interp_x, dim=2)
+        u = p_x.ceil().long()
+        l = p_x.floor().long()
+        w = p_x - l
         # [B, heads, H, W, W]
+        _, _, H, W, _ = p_x.shape
+        assert T == H * W
+        assert P == self.max_npos
+        z_row = z.reshape(B, heads,H ,W, P)
+        z_ceil = z_row.gather(-1, u)
+        # gather causes [B, heads, H, W, W]
+        z_floor = z_row.gather(-1, l)
+        interp_x = w * z_ceil + (1 - w) * z_floor
+
         interp_x = interp_x.flatten(2, 3)
         # [B, heads, T , W]
         return interp_x
 
     def _calc_g_y(self,q,k,H_patched,W_patched):
-        g_y = []
+        B_q, heads_q, T_q, d_q = q.shape
+        B_k, heads_k, T_k, d_k = k.shape
 
-        for i in range(W_patched):
-            q_col = q[...,i::W_patched,:]
-            # q_col: [B, heads, H, d]
-            k_col = k[..., i::W_patched, :]
-
-            # [B, heads, H, H]
-            g_y_i = torch.sigmoid(q_col @ k_col.transpose(-2,-1))
-            g_y.append(g_y_i)
+        q_col = q.reshape(B_q, heads_q, H_patched,W_patched, d_q)
+        q_col = q_col.transpose(2,3) # the cool trick here to force (0,3)(1,4) etc..
+        k_col = k.reshape(B_k, heads_k, H_patched,W_patched, d_k)
+        k_col = k_col.transpose(2,3)
+        g_y = torch.sigmoid(q_col @ k_col.transpose(-2, -1))
 
         return g_y
 
-    def _interp_y(self,p_y,W_patched,q):
-        interp_y = []
+    def _interp_y(self,p_y,q):
         z = q @ self.e_y
-        # [B, heads, T, P]
+        B, heads, T, P = z.shape
+        u = p_y.ceil().long()
+        l = p_y.floor().long()
+        w = p_y - l
 
-        for i,p_y_i in enumerate(p_y):
-            z_col = z[...,i::W_patched,:]
-            u = p_y_i.ceil().long()
-            l = p_y_i.floor().long()
-            w = p_y_i - l
+        _, _, W, H, _ = p_y.shape
+        z_col = z.reshape(B, heads, H,W, P)
+        z_col = z_col.transpose(2,3)
+        # [B, heads, W,H, P]
+        z_ceil = z_col.gather(-1, u)
+        # [B, heads, W,H, H]
+        z_floor = z_col.gather(-1, l)
+        interp_y = w * z_ceil + (1 - w) * z_floor
 
-            z_ceil = z_col.gather(-1,u)
-            z_floor = z_col.gather(-1,l)
-            interp = w * z_ceil + (1-w)*z_floor
-            interp_y.append(interp)
-
-        interp_y = torch.stack(interp_y,dim=2)
         #now we need to fix # [B, heads, W, H, H] -> # [B,heads,H,W,H]
         interp_y = interp_y.transpose(2,3)
         interp_y = interp_y.flatten(2,3)
